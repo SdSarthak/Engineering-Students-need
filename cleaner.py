@@ -29,7 +29,11 @@ _USER_MENTION_RE = re.compile(r"(?<![A-Za-z0-9])/?u/[A-Za-z0-9_-]+")
 _SUBREDDIT_MENTION_RE = re.compile(r"(?<![A-Za-z0-9])/?r/[A-Za-z0-9_-]+")
 _BLANK_LINES_RE = re.compile(r"\n\s*\n\s*")
 _HORIZONTAL_SPACE_RE = re.compile(r"[ \t]+")
-_LINE_MARKER_RE = re.compile(r"^\s*(?:[>\-*+]\s*)+", flags=re.MULTILINE)
+# Leading quote (`>`) and list (`-`, `*`, `+`) markers. A dash only counts as a
+# marker when whitespace follows it, so "-5 degrees" keeps its minus sign.
+_LINE_MARKER_RE = re.compile(
+    r"^[ \t]*(?:>[ \t]*|[-*+](?=[ \t])[ \t]*)+", flags=re.MULTILINE
+)
 _BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
 _ITALIC_RE = re.compile(r"\*([^*]+)\*")
 _CODE_RE = re.compile(r"`([^`]+)`")
@@ -135,11 +139,14 @@ class TextCleaner:
         text = _USER_MENTION_RE.sub("", text)
         text = _SUBREDDIT_MENTION_RE.sub("", text)
 
-        text = _LINE_MARKER_RE.sub("", text)
+        # Emphasis is unwrapped before list markers are stripped: doing it the
+        # other way round eats the leading asterisks of "**bold**" and leaves
+        # the trailing ones stranded.
         text = _BOLD_RE.sub(r"\1", text)
         text = _ITALIC_RE.sub(r"\1", text)
         text = _CODE_RE.sub(r"\1", text)
         text = _STRIKE_RE.sub(r"\1", text)
+        text = _LINE_MARKER_RE.sub("", text)
 
         text = _DOTS_RE.sub("...", text)
         text = _BANGS_RE.sub("!", text)

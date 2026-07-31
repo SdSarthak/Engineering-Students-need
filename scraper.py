@@ -1,368 +1,510 @@
 """
 Reddit Scraper for r/EngineeringStudents
-Scrapes posts using PRAW (Python Reddit API Wrapper) with free client credentials.
-Respects rate limits and Reddit's terms of service.
+Scrapes posts and their full comment trees using PRAW (Python Reddit API
+Wrapper) with free client credentials. Respects rate limits and Reddit's
+terms of service.
 """
 
-import praw
 import json
 import os
 import time
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 import logging
+
 from tqdm import tqdm
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('scraper.log'),
-        logging.StreamHandler()
-    ]
-)
+import config
+
 logger = logging.getLogger(__name__)
+
+PROGRESS_FILENAME = "scraping_progress.json"
 
 
 class RedditScraper:
-    """Reddit scraper for r/EngineeringStudents using PRAW."""
-    
-    def __init__(self, client_id: str, client_secret: str, user_agent: str):
+    """Reddit scraper for a single subreddit using PRAW."""
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        user_agent: str,
+        subreddit: Optional[str] = None,
+        data_dir: Optional[str] = None,
+        rate_limit_delay: Optional[float] = None,
+        max_comment_depth: Optional[int] = None,
+        reddit: Any = None,
+    ):
         """
-        Initialize Reddit scraper with PRAW.
-        
+        Initialize the scraper.
+
         Args:
-            client_id: Reddit app client ID (free)
-            client_secret: Reddit app client secret (free)
-            user_agent: User agent string for API requests
+            client_id: Reddit app client ID (free).
+            client_secret: Reddit app client secret (free).
+            user_agent: User agent string for API requests.
+            subreddit: Subreddit to scrape (defaults to config.TARGET_SUBREDDIT).
+            data_dir: Directory for raw JSON batches (defaults to config.RAW_DATA_DIR).
+            rate_limit_delay: Seconds to sleep between submissions.
+            max_comment_depth: Maximum reply nesting depth to follow.
+            reddit: Pre-built Reddit client. Mainly a test seam - when omitted a
+                PRAW client is created from the credentials above.
         """
-        self.reddit = praw.Reddit(
-            client_id=client_id,
-            client_secret=client_secret,
-            user_agent=user_agent
+        if reddit is not None:
+            self.reddit = reddit
+        else:
+            if not client_id or not client_secret:
+                raise ValueError(
+                    "Reddit credentials are required. Set REDDIT_CLIENT_ID and "
+                    "REDDIT_CLIENT_SECRET (see .env.example)."
+                )
+            import praw  # imported lazily so the module can be used without network deps
+
+            self.reddit = praw.Reddit(
+                client_id=client_id,
+                client_secret=client_secret,
+                user_agent=user_agent,
+            )
+
+        self.subreddit_name = subreddit or config.TARGET_SUBREDDIT
+        self.data_dir = data_dir or config.RAW_DATA_DIR
+        self.rate_limit_delay = (
+            config.RATE_LIMIT_DELAY if rate_limit_delay is None else rate_limit_delay
         )
-        self.subreddit_name = "EngineeringStudents"
-        self.data_dir = "data/raw"
+        self.max_comment_depth = (
+            config.MAX_COMMENT_DEPTH if max_comment_depth is None else max_comment_depth
+        )
         self.ensure_data_directory()
-        
-    def ensure_data_directory(self):
-        """Ensure the data directory exists."""
+
+    # ------------------------------------------------------------------
+    # Progress tracking
+    # ------------------------------------------------------------------
+
+    def ensure_data_directory(self) -> None:
+        """Ensure the raw data directory exists."""
         os.makedirs(self.data_dir, exist_ok=True)
-        
+
     def get_progress_file(self) -> str:
-        """Get the path to the progress tracking file."""
-        return os.path.join(self.data_dir, "scraping_progress.json")
-    
+        """Path to the progress tracking file."""
+        return os.path.join(self.data_dir, PROGRESS_FILENAME)
+
     def load_progress(self) -> Dict[str, Any]:
-        """Load scraping progress from file."""
+        """
+        Load scraping progress from disk.
+
+        Returns a dict with `seen_ids` (list of post IDs already saved),
+        `total_posts` and `last_run`. Progress files written by older versions
+        only recorded `last_processed_id`; that value is folded into `seen_ids`.
+        """
+        default = {"seen_ids": [], "total_posts": 0, "last_run": None}
         progress_file = self.get_progress_file()
-        if os.path.exists(progress_file):
-            try:
-                with open(progress_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError) as e:
-                logger.warning(f"Could not load progress file: {e}")
-        return {"last_processed_id": None, "total_posts": 0, "last_run": None}
-    
-    def save_progress(self, progress: Dict[str, Any]):
-        """Save scraping progress to file."""
+
+        if not os.path.exists(progress_file):
+            return default
+
+        try:
+            with open(progress_file, "r", encoding="utf-8") as handle:
+                stored = json.load(handle)
+        except (json.JSONDecodeError, IOError, OSError) as exc:
+            logger.warning("Could not load progress file: %s", exc)
+            return default
+
+        if not isinstance(stored, dict):
+            logger.warning("Progress file has unexpected format, starting fresh")
+            return default
+
+        seen_ids = stored.get("seen_ids")
+        if not isinstance(seen_ids, list):
+            seen_ids = []
+        legacy_id = stored.get("last_processed_id")
+        if legacy_id and legacy_id not in seen_ids:
+            seen_ids.append(legacy_id)
+
+        total_posts = stored.get("total_posts", 0)
+        if not isinstance(total_posts, int) or total_posts < 0:
+            total_posts = 0
+
+        return {
+            "seen_ids": seen_ids,
+            "total_posts": total_posts,
+            "last_run": stored.get("last_run"),
+        }
+
+    def save_progress(self, progress: Dict[str, Any]) -> None:
+        """Save scraping progress to disk."""
         progress_file = self.get_progress_file()
         try:
-            with open(progress_file, 'w', encoding='utf-8') as f:
-                json.dump(progress, f, indent=2, default=str)
-        except IOError as e:
-            logger.error(f"Could not save progress file: {e}")
-    
-    def extract_comment_data(self, comment, depth: int = 0) -> Dict[str, Any]:
+            with open(progress_file, "w", encoding="utf-8") as handle:
+                json.dump(progress, handle, indent=2, default=str)
+        except (IOError, OSError) as exc:
+            logger.error("Could not save progress file: %s", exc)
+
+    def next_batch_number(self) -> int:
         """
-        Extract data from a Reddit comment and all its replies recursively.
-        
+        Return the next unused batch number.
+
+        Derived from the files already on disk so a resumed run never
+        overwrites an earlier batch.
+        """
+        highest = 0
+        try:
+            entries = os.listdir(self.data_dir)
+        except (IOError, OSError):
+            return 1
+
+        for filename in entries:
+            if not (filename.startswith("posts_batch_") and filename.endswith(".json")):
+                continue
+            stem = filename[len("posts_batch_") : -len(".json")]
+            if stem.isdigit():
+                highest = max(highest, int(stem))
+        return highest + 1
+
+    # ------------------------------------------------------------------
+    # Extraction
+    # ------------------------------------------------------------------
+
+    def extract_comment_data(self, comment: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
+        """
+        Extract a comment and its direct replies recursively.
+
+        Only *direct* replies are followed at each level. PRAW's `replies.list()`
+        flattens the whole subtree, so recursing over it would store every
+        descendant once per ancestor and blow the output up exponentially.
+
         Args:
-            comment: PRAW comment object
-            depth: Current nesting depth for formatting
-            
+            comment: PRAW comment object.
+            depth: Current nesting depth.
+
         Returns:
-            Dictionary containing comment data and replies
+            Dictionary of comment data, or None when the comment is unusable.
         """
+        comment_id = getattr(comment, "id", None)
         try:
-            # Handle deleted/removed comments
             author = str(comment.author) if comment.author else "[deleted]"
-            body = comment.body if comment.body else ""
-            
-            # Clean up text content
-            if body in ["[deleted]", "[removed]", ""]:
+            body = comment.body or ""
+            if body in ("[deleted]", "[removed]"):
                 body = ""
-            
+
+            created_utc = comment.created_utc
             comment_data = {
-                "id": comment.id,
+                "id": comment_id,
                 "author": author,
                 "body": body,
-                "created_utc": comment.created_utc,
-                "created_date": datetime.fromtimestamp(comment.created_utc).isoformat(),
-                "upvotes": comment.score,
+                "created_utc": created_utc,
+                "created_date": _iso_from_utc(created_utc),
+                "upvotes": getattr(comment, "score", 0),
                 "depth": depth,
-                "permalink": f"https://reddit.com{comment.permalink}",
-                "is_submitter": comment.is_submitter,
-                "scraped_at": datetime.now().isoformat()
+                "permalink": _permalink(comment),
+                "is_submitter": bool(getattr(comment, "is_submitter", False)),
+                "scraped_at": datetime.now().isoformat(),
+                "replies": [],
             }
-            
-            # Recursively extract replies
-            replies = []
-            if hasattr(comment, 'replies') and comment.replies:
-                try:
-                    # Expand comment replies
-                    comment.replies.replace_more(limit=None)
-                    for reply in comment.replies.list():
-                        reply_data = self.extract_comment_data(reply, depth + 1)
-                        if reply_data:
-                            replies.append(reply_data)
-                except Exception as e:
-                    logger.warning(f"Error extracting replies for comment {comment.id}: {e}")
-            
-            comment_data["replies"] = replies
-            return comment_data
-            
-        except Exception as e:
-            logger.error(f"Error extracting data from comment {comment.id}: {e}")
+        except AttributeError as exc:
+            # MoreComments placeholders and deleted stubs land here.
+            logger.debug("Skipping comment %s: %s", comment_id, exc)
+            return None
+        except Exception as exc:  # pragma: no cover - defensive against PRAW errors
+            logger.error("Error extracting data from comment %s: %s", comment_id, exc)
             return None
 
-    def extract_post_data(self, submission) -> Dict[str, Any]:
-        """
-        Extract relevant data from a Reddit submission including all comments.
-        
-        Args:
-            submission: PRAW submission object
-            
-        Returns:
-            Dictionary containing post data and all comments
-        """
+        if depth >= self.max_comment_depth:
+            return comment_data
+
+        for reply in self._direct_replies(comment):
+            reply_data = self.extract_comment_data(reply, depth + 1)
+            if reply_data:
+                comment_data["replies"].append(reply_data)
+
+        return comment_data
+
+    def _direct_replies(self, comment: Any) -> List[Any]:
+        """Return the direct replies of a comment, expanding `MoreComments`."""
+        replies = getattr(comment, "replies", None)
+        if not replies:
+            return []
+
+        replace_more = getattr(replies, "replace_more", None)
+        if callable(replace_more):
+            try:
+                replace_more(limit=None)
+            except Exception as exc:  # pragma: no cover - network dependent
+                logger.warning(
+                    "Could not expand replies for comment %s: %s",
+                    getattr(comment, "id", "?"),
+                    exc,
+                )
+
         try:
-            # Handle deleted/removed posts
+            return list(replies)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning(
+                "Could not read replies for comment %s: %s", getattr(comment, "id", "?"), exc
+            )
+            return []
+
+    def extract_post_data(self, submission: Any) -> Optional[Dict[str, Any]]:
+        """
+        Extract a submission and its full comment tree.
+
+        Args:
+            submission: PRAW submission object.
+
+        Returns:
+            Dictionary containing post data and nested comments, or None.
+        """
+        submission_id = getattr(submission, "id", None)
+        try:
             author = str(submission.author) if submission.author else "[deleted]"
-            title = submission.title if submission.title else "[no title]"
-            selftext = submission.selftext if submission.selftext else ""
-            
-            # Clean up text content
-            if selftext in ["[deleted]", "[removed]", ""]:
+            title = submission.title or "[no title]"
+            selftext = submission.selftext or ""
+            if selftext in ("[deleted]", "[removed]"):
                 selftext = ""
-            
+
+            created_utc = submission.created_utc
             post_data = {
-                "id": submission.id,
+                "id": submission_id,
                 "title": title,
                 "text": selftext,
                 "author": author,
-                "created_utc": submission.created_utc,
-                "created_date": datetime.fromtimestamp(submission.created_utc).isoformat(),
-                "upvotes": submission.score,
-                "num_comments": submission.num_comments,
-                "url": submission.url,
-                "permalink": f"https://reddit.com{submission.permalink}",
-                "is_self": submission.is_self,
-                "over_18": submission.over_18,
-                "stickied": submission.stickied,
-                "subreddit": str(submission.subreddit),
+                "created_utc": created_utc,
+                "created_date": _iso_from_utc(created_utc),
+                "upvotes": getattr(submission, "score", 0),
+                "num_comments": getattr(submission, "num_comments", 0),
+                "url": getattr(submission, "url", ""),
+                "permalink": _permalink(submission),
+                "is_self": bool(getattr(submission, "is_self", False)),
+                "over_18": bool(getattr(submission, "over_18", False)),
+                "stickied": bool(getattr(submission, "stickied", False)),
+                "subreddit": str(getattr(submission, "subreddit", self.subreddit_name)),
                 "scraped_at": datetime.now().isoformat(),
-                "comments": []
+                "comments": [],
             }
-            
-            # Extract all comments
-            try:
-                # Expand all comment trees
-                submission.comments.replace_more(limit=None)
-                logger.info(f"Extracting comments for post {submission.id} ({submission.num_comments} total)")
-                
-                comment_count = 0
-                for comment in submission.comments.list():
-                    comment_data = self.extract_comment_data(comment, depth=0)
-                    if comment_data:
-                        post_data["comments"].append(comment_data)
-                        comment_count += 1
-                
-                logger.info(f"Successfully extracted {comment_count} comments for post {submission.id}")
-                
-            except Exception as e:
-                logger.error(f"Error extracting comments for post {submission.id}: {e}")
-                # Continue with post data even if comments fail
-            
-            return post_data
-            
-        except Exception as e:
-            logger.error(f"Error extracting data from post {submission.id}: {e}")
+        except AttributeError as exc:
+            logger.error("Skipping malformed submission %s: %s", submission_id, exc)
             return None
-    
-    def save_posts_batch(self, posts: List[Dict[str, Any]], batch_num: int):
+        except Exception as exc:  # pragma: no cover - defensive against PRAW errors
+            logger.error("Error extracting data from post %s: %s", submission_id, exc)
+            return None
+
+        post_data["comments"] = self._extract_top_level_comments(submission)
+        return post_data
+
+    def _extract_top_level_comments(self, submission: Any) -> List[Dict[str, Any]]:
+        """Extract the top-level comments of a submission, replies nested inside."""
+        comments = getattr(submission, "comments", None)
+        if not comments:
+            return []
+
+        replace_more = getattr(comments, "replace_more", None)
+        if callable(replace_more):
+            try:
+                replace_more(limit=None)
+            except Exception as exc:  # pragma: no cover - network dependent
+                logger.warning(
+                    "Could not expand comments for post %s: %s",
+                    getattr(submission, "id", "?"),
+                    exc,
+                )
+
+        try:
+            top_level = list(comments)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.error(
+                "Could not read comments for post %s: %s", getattr(submission, "id", "?"), exc
+            )
+            return []
+
+        extracted = []
+        for comment in top_level:
+            comment_data = self.extract_comment_data(comment, depth=0)
+            if comment_data:
+                extracted.append(comment_data)
+
+        logger.debug(
+            "Extracted %d top-level comments for post %s",
+            len(extracted),
+            getattr(submission, "id", "?"),
+        )
+        return extracted
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save_posts_batch(self, posts: List[Dict[str, Any]], batch_num: int) -> Optional[str]:
         """
         Save a batch of posts to a JSON file.
-        
+
         Args:
-            posts: List of post dictionaries
-            batch_num: Batch number for filename
+            posts: List of post dictionaries.
+            batch_num: Batch number used in the filename.
+
+        Returns:
+            Path to the written file, or None when nothing was written.
         """
         if not posts:
-            return
-            
-        filename = f"posts_batch_{batch_num:04d}.json"
+            return None
+
+        filename = "posts_batch_{:04d}.json".format(batch_num)
         filepath = os.path.join(self.data_dir, filename)
-        
+
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(posts, f, indent=2, ensure_ascii=False)
-            logger.info(f"Saved {len(posts)} posts to {filename}")
-        except IOError as e:
-            logger.error(f"Could not save batch {batch_num}: {e}")
-    
-    def scrape_posts(self, limit: int = 0, batch_size: int = 50):
+            with open(filepath, "w", encoding="utf-8") as handle:
+                json.dump(posts, handle, indent=2, ensure_ascii=False)
+        except (IOError, OSError) as exc:
+            logger.error("Could not save batch %d: %s", batch_num, exc)
+            return None
+
+        logger.info("Saved %d posts to %s", len(posts), filename)
+        return filepath
+
+    # ------------------------------------------------------------------
+    # Listing traversal
+    # ------------------------------------------------------------------
+
+    def iter_listings(self, subreddit: Any) -> Iterator[Tuple[str, Any]]:
         """
-        Scrape posts from r/EngineeringStudents with proper pagination.
-        
+        Yield `(label, submissions)` pairs for every configured listing.
+
+        Reddit caps a single listing at roughly 1000 items, so several sorts and
+        time filters are walked in turn to reach a wider slice of the subreddit.
+        Duplicates across listings are filtered out by post ID in `scrape_posts`.
+        """
+        for sort_method in config.SORT_METHODS:
+            if sort_method == "top":
+                for time_filter in config.TOP_TIME_FILTERS:
+                    yield (
+                        "top/{}".format(time_filter),
+                        subreddit.top(limit=None, time_filter=time_filter),
+                    )
+            else:
+                listing = getattr(subreddit, sort_method, None)
+                if listing is None:
+                    logger.warning("Unknown sort method %s, skipping", sort_method)
+                    continue
+                yield sort_method, listing(limit=None)
+
+    def scrape_posts(self, limit: int = 0, batch_size: int = 50) -> Dict[str, Any]:
+        """
+        Scrape posts from the target subreddit.
+
+        Walks each configured listing to exhaustion, skipping posts already
+        recorded in the progress file, and writes batches of `batch_size` posts
+        to `data_dir`.
+
         Args:
-            limit: Maximum number of posts to scrape (0 for no limit - scrape all available)
-            batch_size: Number of posts to save per batch
+            limit: Maximum posts to scrape this run (0 means no limit).
+            batch_size: Posts saved per JSON batch file.
+
+        Returns:
+            The final progress dictionary.
         """
-        logger.info(f"Starting to scrape r/{self.subreddit_name}")
-        if limit == 0:
-            logger.info("No limit set - will scrape ALL available posts using pagination")
-        
-        # Load previous progress
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+
+        logger.info("Starting to scrape r/%s", self.subreddit_name)
+        if limit <= 0:
+            logger.info("No limit set - walking every configured listing to exhaustion")
+
         progress = self.load_progress()
-        last_processed_id = progress.get("last_processed_id")
-        total_posts = progress.get("total_posts", 0)
-        
-        try:
-            subreddit = self.reddit.subreddit(self.subreddit_name)
-            
-            current_batch = []
-            batch_num = (total_posts // batch_size) + 1
-            processed_count = 0
-            skipped_count = 0
-            consecutive_empty_pages = 0
-            max_empty_pages = 3  # Stop after 3 consecutive empty pages
-            
-            # Create progress bar
-            progress_bar = tqdm(
-                desc="Scraping posts",
-                unit="posts",
-                dynamic_ncols=True,
-                bar_format='{l_bar}{bar}| {n_fmt} posts [{elapsed}<{remaining}, {rate_fmt}]'
-            )
-            
-            # Use different sorting methods to get more posts
-            sort_methods = ['hot', 'top']
-            sort_method_index = 0
-            
-            while True:
-                # Get posts using current sort method
-                current_sort = sort_methods[sort_method_index]
-                logger.info(f"Scraping posts sorted by: {current_sort}")
-                
-                if current_sort == 'hot':
-                    posts = subreddit.hot(limit=100)
-                elif current_sort == 'top':
-                    posts = subreddit.top(limit=100, time_filter='year')
-           
-                page_posts = list(posts)
-                
-                if not page_posts:
-                    consecutive_empty_pages += 1
-                    logger.info(f"Empty page {consecutive_empty_pages}/{max_empty_pages} for {current_sort}")
-                    
-                    if consecutive_empty_pages >= max_empty_pages:
-                        logger.info("Reached maximum empty pages, trying next sort method")
-                        sort_method_index += 1
-                        consecutive_empty_pages = 0
-                        
-                        if sort_method_index >= len(sort_methods):
-                            logger.info("All sort methods exhausted, stopping scraping")
-                            break
-                        continue
-                else:
-                    consecutive_empty_pages = 0
-                
-                for submission in page_posts:
-                    # Skip if we've already processed this post
-                    if last_processed_id and submission.id == last_processed_id:
-                        skipped_count += 1
-                        progress_bar.set_postfix({
-                            'processed': processed_count,
-                            'skipped': skipped_count,
-                            'batch': batch_num,
-                            'sort': current_sort
-                        })
-                        continue
-                    
-                    # Extract post data
-                    post_data = self.extract_post_data(submission)
-                    if post_data:
-                        current_batch.append(post_data)
-                        processed_count += 1
-                        
-                        # Update progress bar
-                        progress_bar.update(1)
-                        progress_bar.set_postfix({
-                            'processed': processed_count,
-                            'skipped': skipped_count,
-                            'batch': batch_num,
-                            'comments': len(post_data.get('comments', [])),
-                            'sort': current_sort
-                        })
-                        
-                        # Save batch when it reaches batch_size
-                        if len(current_batch) >= batch_size:
-                            self.save_posts_batch(current_batch, batch_num)
-                            total_posts += len(current_batch)
-                            batch_num += 1
-                            current_batch = []
-                            
-                            # Update progress
-                            progress["last_processed_id"] = post_data["id"]
-                            progress["total_posts"] = total_posts
-                            progress["last_run"] = datetime.now().isoformat()
-                            self.save_progress(progress)
-                    
-                    # Rate limiting - be respectful to Reddit's servers
-                    time.sleep(0.2)  # 200ms delay between requests
-                    
-                    # Break if we've reached the limit
-                    if limit > 0 and processed_count >= limit:
-                        break
-                
-                # Break if we've reached the limit
-                if limit > 0 and processed_count >= limit:
-                    break
-                
-                # If we got fewer than 100 posts, we might be at the end
-                if len(page_posts) < 100:
-                    logger.info(f"Got {len(page_posts)} posts (less than 100), trying next sort method")
-                    sort_method_index += 1
-                    consecutive_empty_pages = 0
-                    
-                    if sort_method_index >= len(sort_methods):
-                        logger.info("All sort methods exhausted, stopping scraping")
-                        break
-            
-            # Save remaining posts in the last batch
-            if current_batch:
-                self.save_posts_batch(current_batch, batch_num)
+        seen_ids = set(progress["seen_ids"])
+        total_posts = progress["total_posts"]
+
+        subreddit = self.reddit.subreddit(self.subreddit_name)
+
+        current_batch: List[Dict[str, Any]] = []
+        batch_num = self.next_batch_number()
+        processed_count = 0
+        skipped_count = 0
+
+        progress_bar = tqdm(
+            desc="Scraping posts",
+            unit="post",
+            total=limit if limit > 0 else None,
+            dynamic_ncols=True,
+        )
+
+        def flush_batch() -> None:
+            """Write the pending batch and persist progress."""
+            nonlocal current_batch, batch_num, total_posts
+            if not current_batch:
+                return
+            if self.save_posts_batch(current_batch, batch_num):
+                batch_num += 1
                 total_posts += len(current_batch)
-                progress["total_posts"] = total_posts
-            
-            # Close progress bar
-            progress_bar.close()
-            
-            # Final progress update
+            current_batch = []
+            progress["seen_ids"] = sorted(seen_ids)
+            progress["total_posts"] = total_posts
             progress["last_run"] = datetime.now().isoformat()
             self.save_progress(progress)
-            
-            logger.info(f"Scraping completed. Total posts processed: {total_posts}")
-            logger.info(f"Posts skipped (already processed): {skipped_count}")
-            
-        except Exception as e:
-            logger.error(f"Error during scraping: {e}")
-            raise
-    
+
+        try:
+            for label, submissions in self.iter_listings(subreddit):
+                if limit > 0 and processed_count >= limit:
+                    break
+
+                logger.info("Scraping listing: %s", label)
+                try:
+                    submission_iter = iter(submissions)
+                except TypeError:  # pragma: no cover - defensive
+                    logger.warning("Listing %s is not iterable, skipping", label)
+                    continue
+
+                while True:
+                    try:
+                        submission = next(submission_iter)
+                    except StopIteration:
+                        break
+                    except Exception as exc:
+                        logger.warning("Listing %s failed mid-iteration: %s", label, exc)
+                        break
+
+                    submission_id = getattr(submission, "id", None)
+                    if submission_id is None or submission_id in seen_ids:
+                        skipped_count += 1
+                        continue
+
+                    post_data = self.extract_post_data(submission)
+                    if post_data:
+                        seen_ids.add(submission_id)
+                        current_batch.append(post_data)
+                        processed_count += 1
+
+                        progress_bar.update(1)
+                        progress_bar.set_postfix(
+                            {
+                                "listing": label,
+                                "skipped": skipped_count,
+                                "comments": len(post_data["comments"]),
+                            }
+                        )
+
+                        if len(current_batch) >= batch_size:
+                            flush_batch()
+
+                    if self.rate_limit_delay > 0:
+                        time.sleep(self.rate_limit_delay)
+
+                    if limit > 0 and processed_count >= limit:
+                        break
+        finally:
+            flush_batch()
+            progress_bar.close()
+            progress["seen_ids"] = sorted(seen_ids)
+            progress["total_posts"] = total_posts
+            progress["last_run"] = datetime.now().isoformat()
+            self.save_progress(progress)
+
+        logger.info(
+            "Scraping completed. New posts: %d, duplicates skipped: %d, total on disk: %d",
+            processed_count,
+            skipped_count,
+            total_posts,
+        )
+        return progress
+
     def get_subreddit_info(self) -> Dict[str, Any]:
-        """Get basic information about the subreddit."""
+        """Get basic information about the target subreddit."""
         try:
             subreddit = self.reddit.subreddit(self.subreddit_name)
             return {
@@ -371,45 +513,58 @@ class RedditScraper:
                 "description": subreddit.description,
                 "subscribers": subreddit.subscribers,
                 "created_utc": subreddit.created_utc,
-                "public_description": subreddit.public_description
+                "public_description": subreddit.public_description,
             }
-        except Exception as e:
-            logger.error(f"Error getting subreddit info: {e}")
+        except Exception as exc:
+            logger.error("Error getting subreddit info: %s", exc)
             return {}
 
 
-def main():
-    """Main function to run the scraper."""
-    # Reddit app credentials (you need to create a free Reddit app)
-    # Go to https://www.reddit.com/prefs/apps and create a "script" app
-    CLIENT_ID = "your_client_id_here"  # Replace with your client ID
-    CLIENT_SECRET = "your_client_secret_here"  # Replace with your client secret
-    USER_AGENT = "EngineeringStudents Scraper v1.0 by /u/your_username"
-    
-    # Check if credentials are set
-    if CLIENT_ID == "your_client_id_here" or CLIENT_SECRET == "your_client_secret_here":
-        logger.error("Please set your Reddit app credentials in the main() function")
-        logger.info("1. Go to https://www.reddit.com/prefs/apps")
-        logger.info("2. Click 'Create App' or 'Create Another App'")
-        logger.info("3. Choose 'script' as the app type")
-        logger.info("4. Copy the client ID and secret to this script")
-        return
-    
+def _iso_from_utc(created_utc: Any) -> str:
+    """Convert a Reddit UTC timestamp to an ISO 8601 string."""
     try:
-        # Initialize scraper
-        scraper = RedditScraper(CLIENT_ID, CLIENT_SECRET, USER_AGENT)
-        
-        # Get subreddit info
-        subreddit_info = scraper.get_subreddit_info()
-        logger.info(f"Scraping r/{subreddit_info.get('name', 'EngineeringStudents')}")
-        logger.info(f"Subscribers: {subreddit_info.get('subscribers', 'Unknown')}")
-        
-        # Start scraping (adjust limit as needed)
-        scraper.scrape_posts(limit=500, batch_size=50)  # Scrape 500 posts in batches of 50
-        
-    except Exception as e:
-        logger.error(f"Scraping failed: {e}")
+        return datetime.utcfromtimestamp(float(created_utc)).isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+def _permalink(item: Any) -> str:
+    """Build an absolute permalink for a submission or comment."""
+    permalink = getattr(item, "permalink", "") or ""
+    if permalink.startswith("http"):
+        return permalink
+    if permalink:
+        return "https://reddit.com{}".format(permalink)
+    return ""
+
+
+def main() -> int:
+    """Run the scraper standalone using credentials from the environment."""
+    from logging_setup import configure_logging
+
+    configure_logging("scraper.log")
+
+    if not config.has_credentials():
+        logger.error("Reddit credentials are not set")
+        logger.info("1. Go to https://www.reddit.com/prefs/apps")
+        logger.info("2. Click 'Create App' and choose the 'script' type")
+        logger.info("3. Copy .env.example to .env and fill in the client id and secret")
+        return 1
+
+    client_id, client_secret, user_agent = config.credentials()
+
+    try:
+        scraper = RedditScraper(client_id, client_secret, user_agent)
+        info = scraper.get_subreddit_info()
+        logger.info("Scraping r/%s", info.get("name", config.TARGET_SUBREDDIT))
+        logger.info("Subscribers: %s", info.get("subscribers", "unknown"))
+        scraper.scrape_posts(limit=config.DEFAULT_LIMIT, batch_size=config.DEFAULT_BATCH_SIZE)
+    except Exception as exc:
+        logger.error("Scraping failed: %s", exc)
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,206 +1,265 @@
 # Reddit Engineering Students Scraper
 
-A modular Python web scraper for collecting posts from r/EngineeringStudents using Reddit's free API. The scraper respects rate limits and Reddit's terms of service while providing clean, human-readable output files.
+A small, dependency-light pipeline that collects posts and full comment threads
+from r/EngineeringStudents through Reddit's free API and turns them into clean,
+human-readable text files.
+
+The pipeline has two independent phases:
+
+| Phase | Module | Needs credentials | Output |
+| --- | --- | --- | --- |
+| Scrape | `scraper.py` | yes | `data/raw/posts_batch_NNNN.json` |
+| Clean | `cleaner.py` | no | `data/clean/cleaned_posts_NNNN.txt` |
+
+`main.py` orchestrates both. Because cleaning is offline, you can re-run it over
+already-scraped batches without touching the Reddit API at all.
 
 ## Features
 
-- **Respectful Scraping**: Uses PRAW (Python Reddit API Wrapper) with proper rate limiting
-- **Modular Design**: Separate components for scraping, cleaning, and orchestration
-- **Progress Tracking**: Saves progress to resume interrupted scraping sessions
-- **Text Cleaning**: Removes HTML, markdown, and special characters for clean output
-- **File Size Management**: Automatically splits output into files ≤ 400MB
-- **Comprehensive Logging**: Detailed logs for monitoring and debugging
+- **Respectful scraping** - PRAW plus a configurable delay between submissions.
+- **Real pagination** - walks `hot`, `new` and `top` across every time filter,
+  deduplicating by post ID, so a run terminates instead of re-reading the same
+  page forever.
+- **Full comment trees** - each comment stores its direct replies nested inside
+  it, so a comment appears exactly once no matter how deep the thread goes.
+- **Resumable** - `data/raw/scraping_progress.json` records every post ID that
+  has been saved; an interrupted run picks up where it stopped.
+- **Bounded output** - cleaned text rotates to a new file once a byte or word
+  budget is reached.
+- **Credentials via environment** - nothing secret lives in the repository.
 
-## Project Structure
+## Project structure
 
 ```
-├── scraper.py          # Reddit scraping logic using PRAW
-├── cleaner.py          # Text processing and cleaning
-├── main.py            # Pipeline orchestration
-├── requirements.txt   # Python dependencies
-├── README.md         # This file
-├── data/
-│   ├── raw/          # Raw JSON files from scraper
-│   └── clean/        # Cleaned text files
-└── logs/             # Log files (created during execution)
+config.py            # environment-driven settings and .env loading
+scraper.py           # PRAW scraping and raw JSON batches
+cleaner.py           # text cleaning, formatting, output rotation
+main.py              # CLI pipeline
+logging_setup.py     # shared logging configuration
+tests/               # pytest suite (synthetic fixtures, no network)
+data/raw/            # scraped JSON        (git-ignored)
+data/clean/          # cleaned text        (git-ignored)
+logs/                # run logs            (git-ignored)
 ```
+
+`data/` and `logs/` are ignored on purpose - scraped Reddit content is not
+redistributed through this repository.
 
 ## Setup
 
-### 1. Install Dependencies
+### 1. Install dependencies
 
 ```bash
 pip install -r requirements.txt
+# for the test suite as well
+pip install -r requirements-dev.txt
 ```
 
-### 2. Get Reddit API Credentials
+### 2. Get Reddit API credentials
 
-1. Go to [Reddit App Preferences](https://www.reddit.com/prefs/apps)
-2. Click "Create App" or "Create Another App"
-3. Choose "script" as the app type
-4. Note down your **Client ID** and **Client Secret**
+1. Go to <https://www.reddit.com/prefs/apps>.
+2. Click **Create App** (or **Create Another App**).
+3. Choose **script** as the app type. Any redirect URI works, e.g.
+   `http://localhost:8080`.
+4. The string under the app name is your **client ID**; the **secret** is shown
+   next to it.
 
-### 3. Set Up Credentials
+Reddit's free API is enough for this pipeline - no paid tier is required.
 
-**Option A: Environment Variables (Recommended)**
+### 3. Provide the credentials
+
 ```bash
-export REDDIT_CLIENT_ID="your_client_id_here"
-export REDDIT_CLIENT_SECRET="your_client_secret_here"
-export REDDIT_USER_AGENT="EngineeringStudents Scraper v1.0 by /u/your_username"
+cp .env.example .env
+# then edit .env
 ```
 
-**Option B: Interactive Input**
-The script will prompt for credentials if environment variables are not set.
+`config.py` reads `.env` at import time and never overrides variables that are
+already exported, so this also works:
+
+```bash
+export REDDIT_CLIENT_ID="your_client_id"
+export REDDIT_CLIENT_SECRET="your_client_secret"
+export REDDIT_USERNAME="your_reddit_username"
+```
+
+If neither is set and you run interactively, `main.py` prompts for the values.
+Pass `--non-interactive` to fail fast instead (useful in cron or CI).
 
 ## Usage
 
-### Basic Usage
-
 ```bash
-# Run the complete pipeline (scraping + cleaning)
+# scrape 500 posts, then clean everything not yet cleaned
 python main.py
 
-# Scrape 500 posts with batches of 50
-python main.py --limit 500 --batch-size 50
-```
+# scrape more, in larger batches
+python main.py --limit 2000 --batch-size 100
 
-### Advanced Options
+# walk every listing to exhaustion
+python main.py --limit 0
 
-```bash
-# Only run the cleaning phase (skip scraping)
+# clean the raw files already on disk, no credentials needed
 python main.py --clean-only
 
-# Only run the scraping phase (skip cleaning)
-python main.py --scrape-only
+# scrape only, leave cleaning for later
+python main.py --scrape-only --limit 200
 
-# Skip scraping and only clean existing raw files
-python main.py --skip-scraping
-
-# Scrape more posts
-python main.py --limit 2000 --batch-size 100
+# a different subreddit
+python main.py --subreddit AskEngineers --limit 100
 ```
 
-### Command Line Arguments
+### Command line arguments
 
-- `--limit N`: Maximum number of posts to scrape (default: 1000)
-- `--batch-size N`: Number of posts per batch (default: 100)
-- `--skip-scraping`: Skip scraping phase, only run cleaning
-- `--clean-only`: Only run the cleaning phase
-- `--scrape-only`: Only run the scraping phase
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--limit N` | `500` | Maximum posts to scrape this run, `0` for unlimited |
+| `--batch-size N` | `50` | Posts per raw JSON batch file |
+| `--subreddit NAME` | `EngineeringStudents` | Subreddit to scrape |
+| `--skip-scraping` | off | Skip scraping, run cleaning only |
+| `--clean-only` | off | Same as above, and skips the credential check |
+| `--scrape-only` | off | Skip cleaning |
+| `--non-interactive` | off | Never prompt for missing credentials |
+
+The modules also run standalone: `python scraper.py` scrapes with the defaults
+from the environment, `python cleaner.py` cleans whatever is in `data/raw`.
+
+## Configuration
+
+Every setting in `config.py` can be overridden by an environment variable, all
+of them listed in `.env.example`:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | empty | API credentials |
+| `REDDIT_USER_AGENT` | built from `REDDIT_USERNAME` | Sent with each request |
+| `TARGET_SUBREDDIT` | `EngineeringStudents` | Subreddit to scrape |
+| `DEFAULT_LIMIT` | `500` | Default `--limit` |
+| `DEFAULT_BATCH_SIZE` | `50` | Default `--batch-size` |
+| `RATE_LIMIT_DELAY` | `0.2` | Seconds between submissions |
+| `MAX_COMMENT_DEPTH` | `10` | Deepest reply level followed |
+| `RAW_DATA_DIR` / `CLEAN_DATA_DIR` | `data/raw`, `data/clean` | Output roots |
+| `LOG_DIR` | `logs` | Where log files are written |
+| `MAX_OUTPUT_FILE_SIZE` | `209715200` (200 MB) | Byte budget per text file |
+| `MAX_OUTPUT_WORDS` | `500000` | Word budget per text file |
 
 ## Output
 
-### Raw Data (`data/raw/`)
-- JSON files containing original post data
-- Batch files: `posts_batch_0001.json`, `posts_batch_0002.json`, etc.
-- Progress tracking: `scraping_progress.json`
+### Raw data (`data/raw/`)
 
-### Clean Data (`data/clean/`)
-- Human-readable text files: `cleaned_posts_0001.txt`, `cleaned_posts_0002.txt`, etc.
-- Each file ≤ 400MB (automatically split when limit reached)
-- Processed files tracking: `processed_files.txt`
+`posts_batch_NNNN.json` holds a list of post objects:
 
-### Sample Output Format
+```json
+{
+  "id": "abc123",
+  "title": "How to prepare for technical interviews?",
+  "text": "I'm a junior and starting to apply for internships...",
+  "author": "username",
+  "created_utc": 1700000000.0,
+  "created_date": "2023-11-14T22:13:20",
+  "upvotes": 25,
+  "num_comments": 8,
+  "url": "https://reddit.com/...",
+  "permalink": "https://reddit.com/r/EngineeringStudents/comments/abc123/",
+  "is_self": true,
+  "over_18": false,
+  "stickied": false,
+  "subreddit": "EngineeringStudents",
+  "scraped_at": "2026-07-31T01:00:00",
+  "comments": [
+    {
+      "id": "def456",
+      "author": "commenter",
+      "body": "LeetCode plus mock interviews.",
+      "upvotes": 12,
+      "depth": 0,
+      "is_submitter": false,
+      "replies": []
+    }
+  ]
+}
+```
+
+`scraping_progress.json` records `seen_ids`, `total_posts` and `last_run`.
+
+### Clean data (`data/clean/`)
 
 ```
-================================================================================
+====================================================================================================
 POST ID: abc123
 AUTHOR: username
-DATE: 2024-01-15T10:30:00
+DATE: 2023-11-14T22:13:20
 UPVOTES: 25
-COMMENTS: 8
---------------------------------------------------------------------------------
+TOTAL COMMENTS: 8
+SCRAPED COMMENTS: 3
+----------------------------------------------------------------------------------------------------
 TITLE: How to prepare for technical interviews?
 
-CONTENT:
-I'm a computer science student in my junior year and I'm starting to apply for internships. What are the best resources for preparing for technical interviews? I've heard about LeetCode but are there other good platforms?
+POST CONTENT:
+I'm a junior and starting to apply for internships. What are the best resources?
 
-================================================================================
+COMMENTS:
+====================================================================================================
++- COMMENT ID: def456
+|  AUTHOR: commenter
+|  DATE: 2023-11-14T23:01:00
+|  UPVOTES: 12
++-
+  LeetCode plus mock interviews.
+
+  +- COMMENT ID: ghi789
+  |  AUTHOR: username (OP)
+  |  DATE: 2023-11-15T00:02:00
+  |  UPVOTES: 3
+  +-
+    Thanks, that helps.
+====================================================================================================
 ```
 
-## Data Fields
+Cleaning strips HTML, markdown links, bare URLs, `/u/` and `/r/` mentions,
+emphasis markers, quote and list markers, and collapses repeated punctuation.
+`processed_files.txt` records which raw batches have been folded in, so
+re-running the cleaner never duplicates text.
 
-Each scraped post includes:
-- **ID**: Reddit post ID
-- **Title**: Post title
-- **Text**: Post content/body
-- **Author**: Username (or [deleted])
-- **Date**: Creation timestamp
-- **Upvotes**: Score/upvotes
-- **Comments**: Number of comments
-- **URL**: Original post URL
-- **Metadata**: Additional Reddit metadata
-
-## Rate Limiting & Compliance
-
-- **Rate Limiting**: 100ms delay between requests (10 requests/second)
-- **Respectful Scraping**: Follows Reddit's API guidelines
-- **No Paid APIs**: Uses only free Reddit API access
-- **Progress Saving**: Can resume interrupted scraping sessions
-
-## Logging
-
-The scraper creates detailed logs:
-- `scraper.log`: Scraping operations
-- `cleaner.log`: Text cleaning operations  
-- `pipeline.log`: Overall pipeline execution
-
-## Error Handling
-
-- Graceful handling of deleted/removed posts
-- Network error recovery
-- Progress preservation on interruption
-- Comprehensive error logging
-
-## Development
-
-### Running Individual Components
+## Tests
 
 ```bash
-# Test scraper only
-python scraper.py
-
-# Test cleaner only  
-python cleaner.py
+python -m pytest
 ```
 
-### Customization
+The suite is deterministic and fully offline: PRAW is replaced with small fake
+submission and comment objects, and every file operation happens in a pytest
+`tmp_path`. No credentials, network or database are required.
 
-- Modify `scraper.py` to change scraping parameters
-- Adjust `cleaner.py` for different text cleaning rules
-- Update `main.py` for pipeline modifications
+## Rate limiting and compliance
+
+- One submission every `RATE_LIMIT_DELAY` seconds (0.2 s by default), on top of
+  PRAW's own rate limiting.
+- Only the free, documented Reddit API is used.
+- Scraped content stays local; `data/` is git-ignored.
+- Respect [Reddit's API terms](https://www.redditinc.com/policies/data-api-terms)
+  and the subreddit's rules when using anything you collect.
 
 ## Troubleshooting
 
-### Common Issues
+**"Reddit credentials are required to scrape"**
+`REDDIT_CLIENT_ID` or `REDDIT_CLIENT_SECRET` is unset. Copy `.env.example` to
+`.env` and fill it in. Cleaning still works: `python main.py --clean-only`.
 
-1. **"Please set your Reddit app credentials"**
-   - Ensure you've created a Reddit app and set the credentials
-   - Check environment variables or enter them interactively
+**`received 401 HTTP response`**
+The client id and secret do not match, or the app is not of type *script*.
+Recreate the app at <https://www.reddit.com/prefs/apps>.
 
-2. **Rate limit errors**
-   - The scraper includes built-in rate limiting
-   - If you still get errors, increase the delay in `scraper.py`
+**The scraper finishes with fewer posts than `--limit`**
+Reddit caps each listing at roughly 1000 items. The scraper already walks
+several sorts and time filters and deduplicates between them, so the ceiling is
+Reddit's, not the scraper's. Re-running later picks up newly posted threads.
 
-3. **Permission errors**
-   - Ensure the script has write permissions for the `data/` directory
-   - Check that the directories exist
+**"All raw files have already been processed"**
+Every batch is recorded in `data/clean/processed_files.txt`. Delete the line for
+a batch (or the whole file) to reprocess it.
 
-4. **Empty output files**
-   - Verify that posts are being scraped (check `data/raw/` for JSON files)
-   - Check logs for any error messages
-
-### Getting Help
-
-- Check the log files for detailed error information
-- Verify your Reddit app credentials are correct
-- Ensure you have a stable internet connection
-- Make sure you're not hitting Reddit's rate limits
+**Empty output files**
+Check `logs/scraper.log` and confirm `data/raw/` actually contains batches.
 
 ## License
 
-This project is for educational purposes. Please respect Reddit's terms of service and use responsibly.
-
-## Contributing
-
-Feel free to submit issues and enhancement requests!
+Educational project. Respect Reddit's terms of service and use responsibly.

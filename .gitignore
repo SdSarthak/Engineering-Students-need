@@ -1,16 +1,42 @@
-﻿.env
+# Credentials
+.env
 *.env
 .env.local
 .env.*.local
 apikeys.txt
 *.key
 *.pem
+credentials.json
+serviceAccount*.json
 secrets.json
 config.json
+praw.ini
+
+# Scraped data and exports
+data/
+*.csv
+*.parquet
+*.db
+*.sqlite3
+*.xlsx
+
+# Logs
+logs/
+*.log
+
+# Python
 __pycache__/
-*.pyc
-node_modules/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
 venv/
 env/
+.venv/
+
+# Editors / OS
 .vscode/
 .idea/
+node_modules/
+.DS_Store
+Thumbs.db

@@ -1,480 +1,486 @@
 """
 Text Cleaner for Reddit Posts
-Processes raw JSON files from scraper and converts them to clean, human-readable text files.
-Handles file size limits and text cleaning operations.
+Processes the raw JSON batches produced by the scraper and converts them into
+clean, human-readable text files, rotating output once a size or word budget is
+reached.
 """
 
+import html
 import json
+import logging
 import os
 import re
-import logging
-from typing import List, Dict, Any, Generator
-from datetime import datetime
-import html
+from typing import Any, Dict, List, Optional
+
 from tqdm import tqdm
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('cleaner.log'),
-        logging.StreamHandler()
-    ]
-)
+import config
+
 logger = logging.getLogger(__name__)
+
+PROCESSED_INDEX = "processed_files.txt"
+OUTPUT_PREFIX = "cleaned_posts_"
+
+# Substitutions applied in order by `clean_text`.
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_URL_RE = re.compile(r"https?://\S+")
+_USER_MENTION_RE = re.compile(r"(?<![A-Za-z0-9])/?u/[A-Za-z0-9_-]+")
+_SUBREDDIT_MENTION_RE = re.compile(r"(?<![A-Za-z0-9])/?r/[A-Za-z0-9_-]+")
+_BLANK_LINES_RE = re.compile(r"\n\s*\n\s*")
+_HORIZONTAL_SPACE_RE = re.compile(r"[ \t]+")
+_LINE_MARKER_RE = re.compile(r"^\s*(?:[>\-*+]\s*)+", flags=re.MULTILINE)
+_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
+_ITALIC_RE = re.compile(r"\*([^*]+)\*")
+_CODE_RE = re.compile(r"`([^`]+)`")
+_STRIKE_RE = re.compile(r"~~([^~]+)~~")
+_DOTS_RE = re.compile(r"\.{3,}")
+_BANGS_RE = re.compile(r"!{2,}")
+_QUESTIONS_RE = re.compile(r"\?{2,}")
 
 
 class TextCleaner:
-    """Text cleaner for Reddit posts."""
-    
-    def __init__(self, raw_dir: str = "data/raw", clean_dir: str = "data/clean", max_file_size: int = 200 * 1024 * 1024, max_words: int = 500000):
+    """Turns raw scraper JSON into readable, size-bounded text files."""
+
+    def __init__(
+        self,
+        raw_dir: Optional[str] = None,
+        clean_dir: Optional[str] = None,
+        max_file_size: Optional[int] = None,
+        max_words: Optional[int] = None,
+    ):
         """
-        Initialize text cleaner.
-        
+        Initialize the cleaner.
+
         Args:
-            raw_dir: Directory containing raw JSON files
-            clean_dir: Directory to save cleaned text files
-            max_file_size: Maximum file size in bytes (default 200MB)
-            max_words: Maximum word count per file (default 500,000 words)
+            raw_dir: Directory containing raw JSON batches.
+            clean_dir: Directory to write cleaned text files into.
+            max_file_size: Maximum output file size in bytes.
+            max_words: Maximum word count per output file.
         """
-        self.raw_dir = raw_dir
-        self.clean_dir = clean_dir
-        self.max_file_size = max_file_size
-        self.max_words = max_words
+        self.raw_dir = raw_dir or config.RAW_DATA_DIR
+        self.clean_dir = clean_dir or config.CLEAN_DATA_DIR
+        self.max_file_size = (
+            config.MAX_OUTPUT_FILE_SIZE if max_file_size is None else max_file_size
+        )
+        self.max_words = config.MAX_OUTPUT_WORDS if max_words is None else max_words
         self.ensure_clean_directory()
-        
-    def ensure_clean_directory(self):
-        """Ensure the clean directory exists."""
+
+    def ensure_clean_directory(self) -> None:
+        """Ensure the output directory exists."""
         os.makedirs(self.clean_dir, exist_ok=True)
-    
+
+    # ------------------------------------------------------------------
+    # Bookkeeping
+    # ------------------------------------------------------------------
+
     def count_words(self, text: str) -> int:
-        """Count words in text."""
+        """Count whitespace-separated words in `text`."""
         if not text:
             return 0
-        # Split by whitespace and filter out empty strings
-        words = [word for word in text.split() if word.strip()]
-        return len(words)
-    
+        return len(text.split())
+
     def get_file_word_count(self, filepath: str) -> int:
-        """Get word count of existing file."""
+        """Word count of an existing file, or 0 when it cannot be read."""
         if not os.path.exists(filepath):
             return 0
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
-                return self.count_words(content)
-        except IOError:
+            with open(filepath, "r", encoding="utf-8") as handle:
+                return self.count_words(handle.read())
+        except (IOError, OSError):
             return 0
-    
+
     def get_processed_files(self) -> set:
-        """Get set of already processed JSON files."""
-        processed_file = os.path.join(self.clean_dir, "processed_files.txt")
-        if os.path.exists(processed_file):
-            try:
-                with open(processed_file, 'r', encoding='utf-8') as f:
-                    return set(line.strip() for line in f if line.strip())
-            except IOError:
-                pass
-        return set()
-    
-    def mark_file_processed(self, filename: str):
-        """Mark a JSON file as processed."""
-        processed_file = os.path.join(self.clean_dir, "processed_files.txt")
+        """Set of raw JSON files already folded into the output."""
+        index_path = os.path.join(self.clean_dir, PROCESSED_INDEX)
+        if not os.path.exists(index_path):
+            return set()
         try:
-            with open(processed_file, 'a', encoding='utf-8') as f:
-                f.write(f"{filename}\n")
-        except IOError as e:
-            logger.error(f"Could not mark file as processed: {e}")
-    
+            with open(index_path, "r", encoding="utf-8") as handle:
+                return {line.strip() for line in handle if line.strip()}
+        except (IOError, OSError) as exc:
+            logger.warning("Could not read processed-file index: %s", exc)
+            return set()
+
+    def mark_file_processed(self, filename: str) -> None:
+        """Record a raw JSON file as processed."""
+        index_path = os.path.join(self.clean_dir, PROCESSED_INDEX)
+        try:
+            with open(index_path, "a", encoding="utf-8") as handle:
+                handle.write("{}\n".format(filename))
+        except (IOError, OSError) as exc:
+            logger.error("Could not mark %s as processed: %s", filename, exc)
+
+    # ------------------------------------------------------------------
+    # Text cleaning
+    # ------------------------------------------------------------------
+
     def clean_text(self, text: str) -> str:
         """
-        Clean text content by removing HTML, links, and special characters.
-        
+        Strip HTML, markdown and Reddit-specific noise out of `text`.
+
         Args:
-            text: Raw text to clean
-            
+            text: Raw text to clean.
+
         Returns:
-            Cleaned text
+            Cleaned text, or an empty string when nothing survives.
         """
-        if not text or text.strip() == "":
+        if not text or not text.strip():
             return ""
-        
-        # Decode HTML entities
+
         text = html.unescape(text)
-        
-        # Remove HTML tags
-        text = re.sub(r'<[^>]+>', '', text)
-        
-        # Remove Reddit markdown links [text](url) -> text
-        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-        
-        # Remove standalone URLs
-        text = re.sub(r'https?://[^\s]+', '', text)
-        
-        # Remove Reddit user mentions
-        text = re.sub(r'/u/[A-Za-z0-9_-]+', '', text)
-        text = re.sub(r'u/[A-Za-z0-9_-]+', '', text)
-        
-        # Remove subreddit mentions
-        text = re.sub(r'/r/[A-Za-z0-9_-]+', '', text)
-        text = re.sub(r'r/[A-Za-z0-9_-]+', '', text)
-        
-        # Remove excessive whitespace and newlines
-        text = re.sub(r'\n\s*\n', '\n\n', text)  # Multiple newlines to double newlines
-        text = re.sub(r'[ \t]+', ' ', text)  # Multiple spaces to single space
-        
-        # Remove special Reddit formatting
-        text = re.sub(r'^\s*[>\-*+]\s*', '', text, flags=re.MULTILINE)  # Remove quote markers and list markers
-        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # Remove bold formatting
-        text = re.sub(r'\*([^*]+)\*', r'\1', text)  # Remove italic formatting
-        text = re.sub(r'`([^`]+)`', r'\1', text)  # Remove code formatting
-        text = re.sub(r'~~([^~]+)~~', r'\1', text)  # Remove strikethrough
-        
-        # Remove excessive punctuation
-        text = re.sub(r'[.]{3,}', '...', text)  # Multiple dots to three dots
-        text = re.sub(r'[!]{2,}', '!', text)  # Multiple exclamation marks to one
-        text = re.sub(r'[?]{2,}', '?', text)  # Multiple question marks to one
-        
-        # Clean up the text
-        text = text.strip()
-        
-        return text
-    
+        text = _HTML_TAG_RE.sub("", text)
+        text = _MARKDOWN_LINK_RE.sub(r"\1", text)
+        text = _URL_RE.sub("", text)
+        text = _USER_MENTION_RE.sub("", text)
+        text = _SUBREDDIT_MENTION_RE.sub("", text)
+
+        text = _LINE_MARKER_RE.sub("", text)
+        text = _BOLD_RE.sub(r"\1", text)
+        text = _ITALIC_RE.sub(r"\1", text)
+        text = _CODE_RE.sub(r"\1", text)
+        text = _STRIKE_RE.sub(r"\1", text)
+
+        text = _DOTS_RE.sub("...", text)
+        text = _BANGS_RE.sub("!", text)
+        text = _QUESTIONS_RE.sub("?", text)
+
+        text = _BLANK_LINES_RE.sub("\n\n", text)
+        text = _HORIZONTAL_SPACE_RE.sub(" ", text)
+
+        return text.strip()
+
+    # ------------------------------------------------------------------
+    # Formatting
+    # ------------------------------------------------------------------
+
     def format_comment_for_output(self, comment: Dict[str, Any], depth: int = 0) -> str:
         """
-        Format a single comment and its replies for text output.
-        
+        Render a comment and its replies as indented text.
+
         Args:
-            comment: Comment dictionary from JSON
-            depth: Current nesting depth for indentation
-            
+            comment: Comment dictionary from a raw JSON batch.
+            depth: Nesting depth, used for indentation.
+
         Returns:
-            Formatted text string
+            Formatted text, or an empty string when the comment and all of its
+            replies are empty.
         """
-        # Extract and clean data
-        body = self.clean_text(comment.get('body', ''))
-        author = comment.get('author', '[deleted]')
-        created_date = comment.get('created_date', '')
-        upvotes = comment.get('upvotes', 0)
-        comment_id = comment.get('id', '')
-        is_submitter = comment.get('is_submitter', False)
-        
-        # Skip empty comments
-        if not body:
+        body = self.clean_text(comment.get("body", ""))
+
+        reply_blocks = []
+        for reply in comment.get("replies") or []:
+            rendered = self.format_comment_for_output(reply, depth + 1)
+            if rendered:
+                reply_blocks.append(rendered)
+
+        # A deleted comment that still has visible replies is kept as a stub so
+        # the reply thread does not lose its structure.
+        if not body and not reply_blocks:
             return ""
-        
-        # Create indentation based on depth
+
         indent = "  " * depth
-        reply_indent = "  " * (depth + 1)
-        
-        # Format the comment
-        output_lines = []
-        
-        # Comment header
-        output_lines.append(f"{indent}┌─ COMMENT ID: {comment_id}")
-        output_lines.append(f"{indent}│  AUTHOR: {author}{' (OP)' if is_submitter else ''}")
-        output_lines.append(f"{indent}│  DATE: {created_date}")
-        output_lines.append(f"{indent}│  UPVOTES: {upvotes}")
-        output_lines.append(f"{indent}└─")
-        
-        # Comment body
+        body_indent = "  " * (depth + 1)
+
+        lines = [
+            "{}+- COMMENT ID: {}".format(indent, comment.get("id", "")),
+            "{}|  AUTHOR: {}{}".format(
+                indent,
+                comment.get("author", "[deleted]"),
+                " (OP)" if comment.get("is_submitter") else "",
+            ),
+            "{}|  DATE: {}".format(indent, comment.get("created_date", "")),
+            "{}|  UPVOTES: {}".format(indent, comment.get("upvotes", 0)),
+            "{}+-".format(indent),
+        ]
+
         if body:
-            # Split body into lines and indent each line
-            body_lines = body.split('\n')
-            for line in body_lines:
-                if line.strip():  # Only add non-empty lines
-                    output_lines.append(f"{reply_indent}{line}")
-                else:
-                    output_lines.append("")  # Preserve empty lines
-        
-        output_lines.append("")  # Add spacing after comment
-        
-        # Process replies recursively
-        replies = comment.get('replies', [])
-        if replies:
-            for reply in replies:
-                reply_output = self.format_comment_for_output(reply, depth + 1)
-                if reply_output:
-                    output_lines.append(reply_output)
-        
-        return "\n".join(output_lines)
+            for line in body.split("\n"):
+                lines.append("{}{}".format(body_indent, line) if line.strip() else "")
+        else:
+            lines.append("{}[removed]".format(body_indent))
+
+        lines.append("")
+        lines.extend(reply_blocks)
+
+        return "\n".join(lines)
 
     def format_post_for_output(self, post: Dict[str, Any]) -> str:
         """
-        Format a single post and all its comments for text output.
-        
+        Render a post and its comment tree as text.
+
         Args:
-            post: Post dictionary from JSON
-            
+            post: Post dictionary from a raw JSON batch.
+
         Returns:
-            Formatted text string
+            Formatted text, or an empty string for posts with no content.
         """
-        # Extract and clean data
-        title = self.clean_text(post.get('title', ''))
-        text = self.clean_text(post.get('text', ''))
-        author = post.get('author', '[deleted]')
-        created_date = post.get('created_date', '')
-        upvotes = post.get('upvotes', 0)
-        num_comments = post.get('num_comments', 0)
-        post_id = post.get('id', '')
-        comments = post.get('comments', [])
-        
-        # Skip posts with no meaningful content
-        if not title and not text and not comments:
+        title = self.clean_text(post.get("title", ""))
+        text = self.clean_text(post.get("text", ""))
+        comments = post.get("comments") or []
+
+        comment_blocks = []
+        for comment in comments:
+            rendered = self.format_comment_for_output(comment, depth=0)
+            if rendered:
+                comment_blocks.append(rendered)
+
+        if not title and not text and not comment_blocks:
             return ""
-        
-        # Format the post
-        output_lines = []
-        output_lines.append("=" * 100)
-        output_lines.append(f"POST ID: {post_id}")
-        output_lines.append(f"AUTHOR: {author}")
-        output_lines.append(f"DATE: {created_date}")
-        output_lines.append(f"UPVOTES: {upvotes}")
-        output_lines.append(f"TOTAL COMMENTS: {num_comments}")
-        output_lines.append(f"SCRAPED COMMENTS: {len(comments)}")
-        output_lines.append("-" * 100)
-        
+
+        rule = "=" * 100
+        lines = [
+            rule,
+            "POST ID: {}".format(post.get("id", "")),
+            "AUTHOR: {}".format(post.get("author", "[deleted]")),
+            "DATE: {}".format(post.get("created_date", "")),
+            "UPVOTES: {}".format(post.get("upvotes", 0)),
+            "TOTAL COMMENTS: {}".format(post.get("num_comments", 0)),
+            "SCRAPED COMMENTS: {}".format(_count_comments(comments)),
+            "-" * 100,
+        ]
+
         if title:
-            output_lines.append(f"TITLE: {title}")
-            output_lines.append("")
-        
+            lines.extend(["TITLE: {}".format(title), ""])
+
         if text:
-            output_lines.append("POST CONTENT:")
-            output_lines.append(text)
-            output_lines.append("")
-        
-        # Add comments section
-        if comments:
-            output_lines.append("COMMENTS:")
-            output_lines.append("=" * 100)
-            
-            for comment in comments:
-                comment_output = self.format_comment_for_output(comment, depth=0)
-                if comment_output:
-                    output_lines.append(comment_output)
-            
-            output_lines.append("=" * 100)
+            lines.extend(["POST CONTENT:", text, ""])
+
+        if comment_blocks:
+            lines.extend(["COMMENTS:", rule])
+            lines.extend(comment_blocks)
+            lines.append(rule)
         else:
-            output_lines.append("NO COMMENTS SCRAPED")
-        
-        output_lines.append("=" * 100)
-        output_lines.append("")
-        
-        return "\n".join(output_lines)
-    
+            lines.append("NO COMMENTS SCRAPED")
+
+        lines.extend([rule, ""])
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Output files
+    # ------------------------------------------------------------------
+
     def get_json_files(self) -> List[str]:
-        """Get list of JSON files to process."""
-        if not os.path.exists(self.raw_dir):
-            logger.error(f"Raw directory {self.raw_dir} does not exist")
+        """Sorted list of raw JSON batch files awaiting processing."""
+        if not os.path.isdir(self.raw_dir):
+            logger.error("Raw directory %s does not exist", self.raw_dir)
             return []
-        
-        json_files = []
-        for filename in os.listdir(self.raw_dir):
-            if filename.endswith('.json') and not filename.startswith('scraping_progress'):
-                json_files.append(filename)
-        
-        return sorted(json_files)
-    
+        return sorted(
+            name
+            for name in os.listdir(self.raw_dir)
+            if name.endswith(".json") and not name.startswith("scraping_progress")
+        )
+
     def load_json_file(self, filename: str) -> List[Dict[str, Any]]:
         """
-        Load posts from a JSON file.
-        
+        Load posts from a raw JSON batch.
+
         Args:
-            filename: Name of the JSON file
-            
+            filename: File name inside `raw_dir`.
+
         Returns:
-            List of post dictionaries
+            List of post dictionaries (empty when the file is unreadable).
         """
         filepath = os.path.join(self.raw_dir, filename)
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-                else:
-                    logger.warning(f"Unexpected data format in {filename}")
-                    return []
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"Error loading {filename}: {e}")
+            with open(filepath, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (json.JSONDecodeError, IOError, OSError) as exc:
+            logger.error("Error loading %s: %s", filename, exc)
             return []
-    
+
+        if isinstance(data, list):
+            return [post for post in data if isinstance(post, dict)]
+        if isinstance(data, dict):
+            return [data]
+
+        logger.warning("Unexpected data format in %s", filename)
+        return []
+
     def get_next_output_filename(self) -> str:
-        """Get the next available output filename."""
+        """Path of the next unused output file."""
         counter = 1
         while True:
-            filename = f"cleaned_posts_{counter:04d}.txt"
-            filepath = os.path.join(self.clean_dir, filename)
+            filepath = os.path.join(
+                self.clean_dir, "{}{:04d}.txt".format(OUTPUT_PREFIX, counter)
+            )
             if not os.path.exists(filepath):
                 return filepath
             counter += 1
-    
+
     def get_current_output_file(self) -> str:
-        """Get the current output file or create a new one if needed."""
-        # Find the most recent output file
-        output_files = [f for f in os.listdir(self.clean_dir) if f.startswith('cleaned_posts_') and f.endswith('.txt')]
-        
-        if not output_files:
+        """
+        Path of the output file to append to.
+
+        Reuses the newest file while it is still under both budgets, otherwise
+        starts a new one.
+        """
+        existing = sorted(
+            name
+            for name in os.listdir(self.clean_dir)
+            if name.startswith(OUTPUT_PREFIX) and name.endswith(".txt")
+        )
+        if not existing:
             return self.get_next_output_filename()
-        
-        # Get the most recent file
-        latest_file = sorted(output_files)[-1]
-        filepath = os.path.join(self.clean_dir, latest_file)
-        
-        # Check if it's under both size and word limits
-        file_size = os.path.getsize(filepath)
-        word_count = self.get_file_word_count(filepath)
-        
-        if file_size < self.max_file_size and word_count < self.max_words:
+
+        filepath = os.path.join(self.clean_dir, existing[-1])
+        size = os.path.getsize(filepath)
+        words = self.get_file_word_count(filepath)
+
+        if size < self.max_file_size and words < self.max_words:
             return filepath
-        else:
-            logger.info(f"Creating new file. Current file: {file_size / (1024*1024):.1f}MB, {word_count:,} words")
-            return self.get_next_output_filename()
-    
-    def process_posts(self):
-        """Process all JSON files and create cleaned text files."""
+
+        logger.info(
+            "Rotating output. Current file: %.1fMB, %d words",
+            size / (1024 * 1024),
+            words,
+        )
+        return self.get_next_output_filename()
+
+    # ------------------------------------------------------------------
+    # Pipeline
+    # ------------------------------------------------------------------
+
+    def process_posts(self) -> Dict[str, Any]:
+        """
+        Convert every unprocessed raw batch into cleaned text.
+
+        Returns:
+            Summary dict with `posts_written`, `files_processed` and
+            `output_files`.
+        """
         logger.info("Starting text cleaning process")
-        
+
+        summary = {"posts_written": 0, "files_processed": 0, "output_files": []}
+
         processed_files = self.get_processed_files()
         json_files = self.get_json_files()
-        
+
         if not json_files:
-            logger.warning("No JSON files found to process")
-            return
-        
-        # Filter out already processed files
-        files_to_process = [f for f in json_files if f not in processed_files]
-        
-        if not files_to_process:
-            logger.info("All files have already been processed")
-            return
-        
-        total_posts_processed = 0
-        current_output_file = self.get_current_output_file()
-        
-        # Create progress bar for files
-        file_progress = tqdm(
-            files_to_process,
-            desc="Processing files",
-            unit="file",
-            dynamic_ncols=True,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} files [{elapsed}<{remaining}, {rate_fmt}]'
-        )
-        
-        for json_filename in file_progress:
-            file_progress.set_postfix({'current_file': json_filename})
-            
-            posts = self.load_json_file(json_filename)
-            
-            if not posts:
-                logger.warning(f"No posts found in {json_filename}")
+            logger.warning("No JSON files found in %s", self.raw_dir)
+            return summary
+
+        pending = [name for name in json_files if name not in processed_files]
+        if not pending:
+            logger.info("All %d raw files have already been processed", len(json_files))
+            return summary
+
+        current_path = self.get_current_output_file()
+        # Byte and word budgets are tracked in memory: re-reading a multi-hundred
+        # megabyte output file after every post made cleaning quadratic.
+        current_size = os.path.getsize(current_path) if os.path.exists(current_path) else 0
+        current_words = self.get_file_word_count(current_path)
+        summary["output_files"].append(current_path)
+
+        handle = open(current_path, "a", encoding="utf-8")
+        try:
+            file_progress = tqdm(pending, desc="Processing files", unit="file", dynamic_ncols=True)
+            for json_filename in file_progress:
+                file_progress.set_postfix({"file": json_filename})
+                posts = self.load_json_file(json_filename)
+
+                if not posts:
+                    logger.warning("No posts found in %s", json_filename)
+                    self.mark_file_processed(json_filename)
+                    summary["files_processed"] += 1
+                    continue
+
+                for post in posts:
+                    formatted = self.format_post_for_output(post)
+                    if not formatted:
+                        continue
+
+                    post_size = len(formatted.encode("utf-8"))
+                    post_words = self.count_words(formatted)
+
+                    rotate = current_size > 0 and (
+                        current_size + post_size > self.max_file_size
+                        or current_words + post_words > self.max_words
+                    )
+                    if rotate:
+                        handle.close()
+                        current_path = self.get_next_output_filename()
+                        current_size = 0
+                        current_words = 0
+                        handle = open(current_path, "a", encoding="utf-8")
+                        summary["output_files"].append(current_path)
+                        logger.info("Opened new output file: %s", os.path.basename(current_path))
+
+                    handle.write(formatted)
+                    current_size += post_size
+                    current_words += post_words
+                    summary["posts_written"] += 1
+
+                # Flush before recording the file as done so a crash cannot mark
+                # a batch processed whose text is still sitting in the buffer.
+                handle.flush()
                 self.mark_file_processed(json_filename)
-                continue
-            
-            # Create progress bar for posts in this file
-            post_progress = tqdm(
-                posts,
-                desc=f"Processing {json_filename}",
-                unit="post",
-                leave=False,
-                dynamic_ncols=True,
-                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} posts [{elapsed}<{remaining}, {rate_fmt}]'
-            )
-            
-            # Process posts and write to output file
-            with open(current_output_file, 'a', encoding='utf-8') as output_file:
-                for post in post_progress:
-                    formatted_post = self.format_post_for_output(post)
-                    if formatted_post:
-                        # Check if adding this post would exceed limits
-                        post_size = len(formatted_post.encode('utf-8'))
-                        post_word_count = self.count_words(formatted_post)
-                        
-                        current_size = os.path.getsize(current_output_file)
-                        current_word_count = self.get_file_word_count(current_output_file)
-                        
-                        # Check both file size and word count limits
-                        if (current_size + post_size > self.max_file_size or 
-                            current_word_count + post_word_count > self.max_words):
-                            # Close current file and start a new one
-                            output_file.close()
-                            current_output_file = self.get_next_output_filename()
-                            logger.info(f"Created new output file: {os.path.basename(current_output_file)}")
-                            
-                            # Reopen for writing
-                            output_file = open(current_output_file, 'a', encoding='utf-8')
-                        
-                        output_file.write(formatted_post)
-                        total_posts_processed += 1
-                        
-                        # Update post progress
-                        current_size = os.path.getsize(current_output_file)
-                        current_word_count = self.get_file_word_count(current_output_file)
-                        post_progress.set_postfix({
-                            'comments': len(post.get('comments', [])),
-                            'size': f"{current_size / (1024*1024):.1f}MB",
-                            'words': f"{current_word_count:,}"
-                        })
-            
-            # Close post progress bar
-            post_progress.close()
-            
-            # Mark file as processed
-            self.mark_file_processed(json_filename)
-            
-            # Update file progress
-            file_progress.set_postfix({
-                'processed_posts': total_posts_processed,
-                'current_file': json_filename
-            })
-        
-        # Close file progress bar
-        file_progress.close()
-        
-        logger.info(f"Text cleaning completed. Total posts processed: {total_posts_processed}")
-        logger.info(f"Output files saved in: {self.clean_dir}")
-    
+                summary["files_processed"] += 1
+            file_progress.close()
+        finally:
+            handle.close()
+
+        logger.info(
+            "Text cleaning completed. Posts written: %d, files processed: %d",
+            summary["posts_written"],
+            summary["files_processed"],
+        )
+        logger.info("Output written to %s", self.clean_dir)
+        return summary
+
     def get_cleaning_stats(self) -> Dict[str, Any]:
-        """Get statistics about the cleaning process."""
-        stats = {
+        """Statistics about the raw inputs and cleaned outputs."""
+        output_files = [
+            name
+            for name in os.listdir(self.clean_dir)
+            if name.startswith(OUTPUT_PREFIX) and name.endswith(".txt")
+        ]
+        total_size = sum(
+            os.path.getsize(os.path.join(self.clean_dir, name)) for name in output_files
+        )
+        return {
             "raw_files": len(self.get_json_files()),
             "processed_files": len(self.get_processed_files()),
-            "output_files": len([f for f in os.listdir(self.clean_dir) if f.startswith('cleaned_posts_')]),
-            "total_output_size": 0
+            "output_files": len(output_files),
+            "total_output_size": total_size,
         }
-        
-        # Calculate total output size
-        for filename in os.listdir(self.clean_dir):
-            if filename.startswith('cleaned_posts_') and filename.endswith('.txt'):
-                filepath = os.path.join(self.clean_dir, filename)
-                stats["total_output_size"] += os.path.getsize(filepath)
-        
-        return stats
 
 
-def main():
-    """Main function to run the cleaner."""
+def _count_comments(comments: List[Dict[str, Any]]) -> int:
+    """Count a comment tree, including every nested reply."""
+    total = 0
+    for comment in comments:
+        total += 1 + _count_comments(comment.get("replies") or [])
+    return total
+
+
+def main() -> int:
+    """Run the cleaner standalone."""
+    from logging_setup import configure_logging
+
+    configure_logging("cleaner.log")
+
     try:
         cleaner = TextCleaner()
-        
-        # Get initial stats
         stats = cleaner.get_cleaning_stats()
-        logger.info(f"Starting with {stats['raw_files']} raw files, {stats['processed_files']} already processed")
-        
-        # Process posts
+        logger.info(
+            "Starting with %d raw files, %d already processed",
+            stats["raw_files"],
+            stats["processed_files"],
+        )
         cleaner.process_posts()
-        
-        # Get final stats
-        final_stats = cleaner.get_cleaning_stats()
-        logger.info(f"Cleaning completed:")
-        logger.info(f"  - Raw files: {final_stats['raw_files']}")
-        logger.info(f"  - Processed files: {final_stats['processed_files']}")
-        logger.info(f"  - Output files: {final_stats['output_files']}")
-        logger.info(f"  - Total output size: {final_stats['total_output_size'] / (1024*1024):.2f} MB")
-        
-    except Exception as e:
-        logger.error(f"Cleaning failed: {e}")
+        final = cleaner.get_cleaning_stats()
+        logger.info("Cleaning completed:")
+        logger.info("  raw files: %d", final["raw_files"])
+        logger.info("  processed files: %d", final["processed_files"])
+        logger.info("  output files: %d", final["output_files"])
+        logger.info("  total output size: %.2f MB", final["total_output_size"] / (1024 * 1024))
+    except Exception as exc:
+        logger.error("Cleaning failed: %s", exc)
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
